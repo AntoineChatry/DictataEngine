@@ -1,0 +1,18 @@
+# Artefacts de build Rust
+/target
+
+# Modèles ASR : volumineux (centaines de Mo à plusieurs Go), téléchargés
+# séparément depuis HuggingFace. Ne JAMAIS committer — le crate ne distribue
+# pas les modèles (cf. licences des modèles, distinctes du code MIT/Apache).
+/models
+
+# Application GUI Dictata : consommateur privé de l'engine, non publié avec le crate.
+/Dictata
+
+# Outillage / caches locaux non partagés
+/.claude/
+/.ruff_cache/
+
+# Fichiers backend / IDE locaux
+Cargo.lock.bak
+*.pdb

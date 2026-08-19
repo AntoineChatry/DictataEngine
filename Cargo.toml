@@ -1,0 +1,84 @@
+[package]
+name = "dictata-engine"
+version = "0.1.0"
+edition = "2024"
+description = "Multi-backend offline ASR engine abstraction (whisper.cpp, NVIDIA Parakeet) for Rust"
+# Simplest permissive OSS license, OSI-approved (distinct from the Dictata app's
+# Commons Clause, which is not OSI). See LICENSE for the full text.
+license = "MIT"
+repository = "https://github.com/AntoineChatry/dictata-engine"
+
+[dependencies]
+# thiserror: pure Rust, light, standard. It is NOT a heavy native dependency
+# (those — whisper-rs, ort — are gated behind per-backend features).
+thiserror = "2"
+
+# whisper.cpp backend (feature `whisper`). Optional: the base crate does not pull
+# it, so there is no C++ build while the feature is off.
+whisper-rs = { version = "0.16.0", optional = true }
+
+# NVIDIA Parakeet backend (feature `parakeet`). Pulls `ort`/onnxruntime.
+parakeet-rs = { version = "0.3", optional = true }
+
+# Shared Silero VAD (feature `vad`). ONNX Runtime is pulled DIRECTLY here, so the
+# VAD works even without Parakeet (whisper-only build). Version pinned to exactly
+# the one parakeet-rs uses: Cargo then unifies both onto a single ONNX Runtime
+# when both features are on. `download-binaries` provides the ort binary in a
+# vad-only build; `std` matches parakeet-rs.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "download-binaries",
+    "copy-dylibs",
+    "tls-native",
+], optional = true }
+
+# FFT for the SenseVoice kaldi-fbank front-end (feature `sensevoice`): pure Rust,
+# no native build. Same version parakeet-rs already pulls, so a combined build
+# shares a single copy.
+realfft = { version = "3.5", optional = true }
+
+[features]
+default = []
+# Backends enabled at compile time. Each isolates its heavy dependencies.
+whisper = ["dep:whisper-rs"]
+# whisper on GPU via Vulkan (AMD/Windows). Requires the Vulkan SDK at build time.
+vulkan = ["whisper", "whisper-rs/vulkan"]
+# Parakeet on CPU (default ONNX Runtime execution provider).
+parakeet = ["dep:parakeet-rs"]
+# Parakeet accelerated via DirectML (AMD/Windows GPU). Automatic CPU fallback.
+parakeet-directml = ["parakeet", "parakeet-rs/directml"]
+# Optional pure-Rust helper to convert arbitrary-rate/multi-channel PCM to the
+# engine's mono 16 kHz contract (linear interpolation, no extra dependency).
+resample = []
+# Shared Silero VAD pre-filter, usable by ALL backends (not tied to a backend).
+# Pulls ONNX Runtime via `ort`; needs a Silero v5 ONNX model (user-provided).
+vad = ["dep:ort"]
+# Speaker diarization ("who spoke when"), Parakeet-only. Wraps parakeet-rs'
+# Sortformer v2 (4 speakers). Additive: a standalone pass beside the trait, never
+# inside it. Needs a Sortformer ONNX model (user-provided).
+diarize = ["parakeet", "parakeet-rs/sortformer"]
+# SenseVoice multilingual ASR backend (feature `sensevoice`). Pulls ONNX Runtime
+# via `ort` directly (like `vad`) plus a pure-Rust FFT for its kaldi-fbank
+# front-end. Needs a sherpa-onnx SenseVoice export (a directory with model.onnx
+# / model.int8.onnx + tokens.txt).
+sensevoice = ["dep:ort", "dep:realfft"]
+# Moonshine English ASR backend (feature `moonshine`). Pulls ONNX Runtime via
+# `ort` directly (like `vad`); its conv front-end lives inside the ONNX graph, so
+# no extra FFT is needed. Needs a sherpa-onnx Moonshine "v1" export (a directory
+# with preprocess/encode/uncached_decode/cached_decode .onnx + tokens.txt).
+moonshine = ["dep:ort"]
+
+[dev-dependencies]
+# Used only by the `mic` example (live microphone capture). Does not enter the
+# crate nor the other targets. Same version as the Dictata app.
+cpal = "0.18.1"
+
+# The whisper example only compiles with the whisper backend: cargo skips it
+# automatically (instead of failing) when the feature is absent.
+[[example]]
+name = "whisper_smoke"
+required-features = ["whisper"]
+
+[[example]]
+name = "parakeet_smoke"
+required-features = ["parakeet"]
