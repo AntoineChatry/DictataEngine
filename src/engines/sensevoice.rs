@@ -288,14 +288,11 @@ impl AsrEngine for SenseVoiceEngine {
         // = 0), while our contract is [-1, 1]; scale back so the CMVN statistics
         // line up with training.
         let scale = if self.normalize_samples { 1.0 } else { 32_768.0 };
-        let (fbank, frames) = compute_fbank(audio, scale);
-        if frames == 0 {
-            // Fewer than one full frame of audio: nothing to transcribe.
-            return Ok(TranscriptionResult::default());
-        }
-        let (mut x, t_lfr) = apply_lfr(&fbank, frames, NUM_MEL, self.lfr_m, self.lfr_n);
-        apply_cmvn(&mut x, t_lfr, self.feat_dim, &self.neg_mean, &self.inv_stddev);
 
+        // Constant across windows: the language / text-norm ids and the input node
+        // names do not depend on the audio, so resolve them once. Cloning the
+        // names also frees the immutable borrow of `self` before the mutable
+        // `self.session.run` inside the loop.
         let lang_id = self.lang_id_for(opts.language.as_deref());
         let with_itn = self.with_itn;
         let blank = self.blank_id;
@@ -304,57 +301,94 @@ impl AsrEngine for SenseVoiceEngine {
         let lang_name = self.lang_name.clone();
         let tnorm_name = self.tnorm_name.clone();
 
-        let x_val = Value::from_array(([1_i64, t_lfr as i64, self.feat_dim as i64], x))
-            .map_err(|e| AsrError::Transcribe(format!("sensevoice x tensor: {e}")))?;
-        let xlen_val = Value::from_array(([1_i64], vec![t_lfr as i32]))
-            .map_err(|e| AsrError::Transcribe(format!("sensevoice x_length tensor: {e}")))?;
-        let lang_val = Value::from_array(([1_i64], vec![lang_id]))
-            .map_err(|e| AsrError::Transcribe(format!("sensevoice language tensor: {e}")))?;
-        let tnorm_val = Value::from_array(([1_i64], vec![with_itn]))
-            .map_err(|e| AsrError::Transcribe(format!("sensevoice text_norm tensor: {e}")))?;
+        // SenseVoice is a short-form CTC model that runs the WHOLE sequence through
+        // ONNX Runtime in one pass: on a long clip the arena balloons (it never
+        // returns its peak to the OS) and the model, trained on <= 30 s, degrades.
+        // Window the audio into bounded chunks (<= 32 s, cut on the least-bad
+        // energy dip) exactly like the Parakeet backend, decode each and
+        // concatenate. Every sample is transcribed exactly once (no overlap).
+        let mut text = String::new();
+        let mut detected_language: Option<String> = None;
+        let total = audio.len();
+        let mut start = 0;
+        while start < audio.len() {
+            // Cooperative cancellation, checked before the expensive pass; progress
+            // is the fraction of samples already consumed.
+            if control.is_cancelled() {
+                return Err(AsrError::Cancelled);
+            }
+            control.report_progress((start as u64 * 100 / total as u64) as u8);
 
-        if control.is_cancelled() {
-            return Err(AsrError::Cancelled);
+            let rest = &audio[start..];
+            let cut = super::find_min_rms_cut(rest);
+            let window = &rest[..cut];
+            start += cut;
+
+            let (fbank, frames) = compute_fbank(window, scale);
+            if frames == 0 {
+                // Fewer than one full frame in this window: nothing to decode.
+                continue;
+            }
+            let (mut x, t_lfr) = apply_lfr(&fbank, frames, NUM_MEL, self.lfr_m, self.lfr_n);
+            apply_cmvn(&mut x, t_lfr, self.feat_dim, &self.neg_mean, &self.inv_stddev);
+
+            let x_val = Value::from_array(([1_i64, t_lfr as i64, self.feat_dim as i64], x))
+                .map_err(|e| AsrError::Transcribe(format!("sensevoice x tensor: {e}")))?;
+            let xlen_val = Value::from_array(([1_i64], vec![t_lfr as i32]))
+                .map_err(|e| AsrError::Transcribe(format!("sensevoice x_length tensor: {e}")))?;
+            let lang_val = Value::from_array(([1_i64], vec![lang_id]))
+                .map_err(|e| AsrError::Transcribe(format!("sensevoice language tensor: {e}")))?;
+            let tnorm_val = Value::from_array(([1_i64], vec![with_itn]))
+                .map_err(|e| AsrError::Transcribe(format!("sensevoice text_norm tensor: {e}")))?;
+
+            // Extract token ids inside a block so the borrow of `session` ends
+            // before we read `self.tokens` below.
+            let ids = {
+                let outputs = self
+                    .session
+                    .run(ort::inputs![
+                        x_name.as_str() => x_val,
+                        xlen_name.as_str() => xlen_val,
+                        lang_name.as_str() => lang_val,
+                        tnorm_name.as_str() => tnorm_val,
+                    ])
+                    .map_err(|e| AsrError::Transcribe(format!("sensevoice inference: {e}")))?;
+
+                let (shape, logits) = outputs[0]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| AsrError::Transcribe(format!("sensevoice logits: {e}")))?;
+                let dims = shape.as_ref();
+                if dims.len() != 3 {
+                    return Err(AsrError::Transcribe(format!(
+                        "sensevoice expected rank-3 logits [1, T, vocab], got shape {dims:?}"
+                    )));
+                }
+                let out_frames = dims[1] as usize;
+                let vocab = dims[2] as usize;
+                greedy_ctc(logits, out_frames, vocab, blank)
+            };
+
+            // The first decoded token is the language tag (`<|en|>` etc.); keep the
+            // one from the first window that yields it (the clip is one language).
+            if detected_language.is_none() {
+                detected_language = ids
+                    .first()
+                    .and_then(|&id| self.tokens.get(id))
+                    .and_then(|tag| lang_name_from_tag(tag));
+            }
+            // SenseVoice prepends 4 meta tokens (language, emotion, event, itn)
+            // before the transcript; skip them.
+            let piece = tokens_to_text(&ids, &self.tokens, 4);
+            if !piece.is_empty() {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(&piece);
+            }
         }
 
-        // Extract token ids inside a block so the borrow of `session` ends before
-        // we read `self.tokens` below.
-        let ids = {
-            let outputs = self
-                .session
-                .run(ort::inputs![
-                    x_name.as_str() => x_val,
-                    xlen_name.as_str() => xlen_val,
-                    lang_name.as_str() => lang_val,
-                    tnorm_name.as_str() => tnorm_val,
-                ])
-                .map_err(|e| AsrError::Transcribe(format!("sensevoice inference: {e}")))?;
-
-            let (shape, logits) = outputs[0]
-                .try_extract_tensor::<f32>()
-                .map_err(|e| AsrError::Transcribe(format!("sensevoice logits: {e}")))?;
-            let dims = shape.as_ref();
-            if dims.len() != 3 {
-                return Err(AsrError::Transcribe(format!(
-                    "sensevoice expected rank-3 logits [1, T, vocab], got shape {dims:?}"
-                )));
-            }
-            let out_frames = dims[1] as usize;
-            let vocab = dims[2] as usize;
-            greedy_ctc(logits, out_frames, vocab, blank)
-        };
-
-        // The first decoded token is the language tag (`<|en|>` etc.); expose it.
-        let detected_language = ids
-            .first()
-            .and_then(|&id| self.tokens.get(id))
-            .and_then(|tag| lang_name_from_tag(tag));
-        // SenseVoice prepends 4 meta tokens (language, emotion, event, itn) before
-        // the transcript; skip them.
-        let text = tokens_to_text(&ids, &self.tokens, 4);
-
-        // The inference is a single non-preemptible run; if the caller cancelled
-        // while it ran, report Cancelled rather than a full Ok.
+        // A cancellation requested during the last non-preemptible run is reported
+        // rather than a full Ok.
         if control.is_cancelled() {
             return Err(AsrError::Cancelled);
         }

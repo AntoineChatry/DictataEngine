@@ -129,7 +129,7 @@ impl AsrEngine for ParakeetEngine {
             }
             control.report_progress((start as u64 * 100 / total as u64) as u8);
             let rest = &audio[start..];
-            let cut = find_min_rms_cut(rest);
+            let cut = super::find_min_rms_cut(rest);
             // `transcribe_samples` takes an owned `Vec<f32>`; we hand it a copy of
             // the window, freed at the end of the iteration. Mono 16 kHz is our
             // input contract. `Sentences` groups tokens into sentence-level spans.
@@ -220,52 +220,6 @@ fn tdt_v3_languages() -> Vec<String> {
     .collect()
 }
 
-/// Hard cap on a transcription window's length, in samples (30 s). No window
-/// ever exceeds this, which is what bounds the ONNX Runtime arena.
-const WINDOW_SAMPLES: usize = 30 * crate::types::SAMPLE_RATE as usize;
-/// A clip up to this length (32 s) is transcribed in a single window. Set above
-/// `WINDOW_SAMPLES` on purpose: whenever we DO split, the remainder after a cut
-/// in the [25 s, 30 s] band is then always >= 2 s. A very short trailing window
-/// (a few hundred ms) makes the model hallucinate; this removes that case by
-/// construction, at the cost of one window occasionally reaching 32 s.
-const SINGLE_WINDOW_MAX_SAMPLES: usize = 32 * crate::types::SAMPLE_RATE as usize;
-/// Start of the cut-point search band (25 s). We only look for an energy dip
-/// between 25 and 30 s: past 25 s of speech we want to cut, but at the best spot
-/// in that band.
-const SEARCH_START_SAMPLES: usize = 25 * crate::types::SAMPLE_RATE as usize;
-/// RMS analysis block size (100 ms).
-const RMS_BLOCK: usize = crate::types::SAMPLE_RATE as usize / 10;
-
-/// Cut position (in samples) of the next window within `rest`.
-///
-/// Returns `rest.len()` when everything fits in a single window (last pass, or a
-/// short clip: identical behaviour to a single call). Otherwise it searches the
-/// [25 s, 30 s] band for the 100 ms block of lowest energy (RMS) and cuts at its
-/// start: we land on the least-bad breath rather than mid-word. If no dip stands
-/// out (continuous speech), the hard cap at 30 s applies — the window is always
-/// bounded. Always `>= 25 s` once `rest` exceeds `SINGLE_WINDOW_MAX_SAMPLES`, so
-/// the calling loop always makes progress.
-fn find_min_rms_cut(rest: &[f32]) -> usize {
-    if rest.len() <= SINGLE_WINDOW_MAX_SAMPLES {
-        return rest.len();
-    }
-    // Default hard cap: kept if the band yields no block (impossible here — the
-    // band is 5 s = 50 blocks — but keeps the window bounded whatever happens).
-    let mut best_start = WINDOW_SAMPLES;
-    let mut best_rms = f32::INFINITY;
-    let mut pos = SEARCH_START_SAMPLES;
-    while pos + RMS_BLOCK <= WINDOW_SAMPLES {
-        let block = &rest[pos..pos + RMS_BLOCK];
-        let rms = (block.iter().map(|s| s * s).sum::<f32>() / RMS_BLOCK as f32).sqrt();
-        if rms < best_rms {
-            best_rms = rms;
-            best_start = pos;
-        }
-        pos += RMS_BLOCK;
-    }
-    best_start
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,70 +253,5 @@ mod tests {
             ParakeetEngine::load(&cfg),
             Err(AsrError::ModelNotFound(_))
         ));
-    }
-
-    const RATE: usize = crate::types::SAMPLE_RATE as usize;
-
-    /// `secs` seconds of a signal at amplitude `amp` (0.0 = silence).
-    fn tone(secs: f32, amp: f32) -> Vec<f32> {
-        let n = (RATE as f32 * secs) as usize;
-        (0..n).map(|i| if i % 2 == 0 { amp } else { -amp }).collect()
-    }
-
-    #[test]
-    fn cut_takes_the_whole_clip_when_it_fits_in_one_window() {
-        // <= 32 s: a single call, cut = full length (identical to the old path).
-        assert_eq!(find_min_rms_cut(&tone(10.0, 0.3)), 10 * RATE);
-        assert_eq!(find_min_rms_cut(&tone(30.0, 0.3)), 30 * RATE);
-        assert_eq!(find_min_rms_cut(&tone(32.0, 0.3)), 32 * RATE);
-    }
-
-    #[test]
-    fn cut_falls_on_the_quietest_block_in_the_search_band() {
-        // 33 s of loud speech with a silence gap at 26.0 s: the cut must land in
-        // that gap (the lowest-energy 100 ms block of the [25 s, 30 s] band).
-        let mut audio = tone(26.0, 0.3);
-        audio.extend(tone(0.2, 0.0)); // silence at 26.0 s
-        audio.extend(tone(6.8, 0.3)); // total 33 s
-        let cut = find_min_rms_cut(&audio);
-        let cut_s = cut as f32 / RATE as f32;
-        assert!(
-            (26.0..=26.3).contains(&cut_s),
-            "cut expected near 26 s (the gap), got {cut_s} s"
-        );
-    }
-
-    #[test]
-    fn cut_stays_within_the_search_band_on_continuous_speech() {
-        // Continuous speech with no dip: the cut stays bounded to [25 s, 30 s],
-        // never beyond (ONNX arena guaranteed flat).
-        let cut = find_min_rms_cut(&tone(40.0, 0.3));
-        assert!(
-            (SEARCH_START_SAMPLES..=WINDOW_SAMPLES).contains(&cut),
-            "cut {cut} outside band [{SEARCH_START_SAMPLES}, {WINDOW_SAMPLES}]"
-        );
-    }
-
-    #[test]
-    fn a_split_never_leaves_a_tiny_trailing_window() {
-        // Whenever the clip is split, the remainder must be >= 2 s, so the last
-        // window never degrades into a hallucination-prone sub-second clip. This
-        // is what the 32 s single-window threshold buys.
-        for secs in [30.1f32, 32.1, 33.0, 45.0, 60.0] {
-            let audio = tone(secs, 0.2);
-            let cut = find_min_rms_cut(&audio);
-            if cut < audio.len() {
-                let tail = audio.len() - cut;
-                assert!(tail >= 2 * RATE, "tail {tail} samples < 2 s at {secs} s");
-            }
-        }
-    }
-
-    #[test]
-    fn cut_always_makes_progress() {
-        // Every cut is > 0, so the windowing loop always advances.
-        for secs in [1.0f32, 15.0, 29.9, 30.0, 32.1, 61.0, 120.0] {
-            assert!(find_min_rms_cut(&tone(secs, 0.2)) > 0, "null cut at {secs} s");
-        }
     }
 }

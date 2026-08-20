@@ -23,6 +23,8 @@ interchangeable transcription backends:
 - **SenseVoice** via ONNX Runtime — multilingual CTC (zh / en / ja / ko / yue) with a pure-Rust
   kaldi-fbank front-end.
 - **Moonshine** via ONNX Runtime — a compact English encoder-decoder for short-form speech.
+- **Zipformer** via ONNX Runtime — an offline RNN-T (transducer) with a pure-Rust kaldi-fbank
+  front-end; language coverage follows whatever model you load (English, multilingual, …).
 
 Pick a backend with a Cargo feature, load a model, hand it audio, get text. The heavy native
 dependency of each backend is gated behind its feature, so the base crate pulls neither
@@ -64,8 +66,9 @@ reassigning a single `Box<dyn AsrEngine>` — see [`examples/switch.rs`](example
 - 🧱 **Stateless between calls** — one instance is safely shared between one-shot and streaming.
 - 🛡️ **Defensive input** — the audio buffer is sanitized (NaN/Inf → silence, clamped to range)
   before it reaches native code that could otherwise crash or produce garbage.
-- 🧠 **Bounded memory on long clips** — the Parakeet path windows internally so ONNX Runtime's
-  arena never balloons on a multi-minute file.
+- 🧠 **Bounded memory on long clips** — the Parakeet, SenseVoice and Moonshine paths window
+  internally (≤ 32 s per window, cut on the lowest-energy point) so ONNX Runtime's arena never
+  balloons on a multi-minute file.
 - ⏱️ **Timestamps** — every result carries timed `segments` (seconds) for subtitles, alignment
   or click-to-seek; ignore them and read `text` when you only want the words.
 - 🛑 **Cancellable with progress** — pass a `TranscribeControl` to cancel a long transcription
@@ -90,6 +93,7 @@ reassigning a single `Box<dyn AsrEngine>` — see [`examples/switch.rs`](example
 | `parakeet-directml` | Parakeet + DirectML            | ONNX Runtime, DirectML    | DirectML (any Windows GPU)  |
 | `sensevoice`        | SenseVoice CTC via `ort`       | ONNX Runtime (`ort`)      | CPU                         |
 | `moonshine`         | Moonshine (EN) via `ort`       | ONNX Runtime (`ort`)      | CPU                         |
+| `zipformer`         | Zipformer RNN-T via `ort`      | ONNX Runtime (`ort`)      | CPU                         |
 | `diarize`           | Sortformer diarization         | ONNX Runtime (`ort`)      | CPU                         |
 
 Features are **additive** — build with `whisper` and `parakeet` at once if you want both.
@@ -106,16 +110,16 @@ dictata-engine = { git = "https://github.com/AntoineChatry/dictata-engine", feat
 `TranscribeOptions` is a superset; a backend cleanly ignores what it does not support. Query
 `capabilities()` up front to know which is which.
 
-| Capability                | whisper.cpp        | Parakeet TDT           | SenseVoice          | Moonshine           |
-| ------------------------- | :----------------: | :--------------------: | :-----------------: | :-----------------: |
-| Languages                 | any (auto-detect)  | 25 (fixed set)         | 5 (fixed set)       | English only        |
-| Initial prompt            | ✅                 | ❌                     | ❌                  | ❌                  |
-| Beam search               | ✅                 | ❌                     | ❌                  | ❌                  |
-| Translate → English       | ✅                 | ❌                     | ❌                  | ❌                  |
-| Internal VAD              | ✅                 | ❌                     | ❌                  | ❌                  |
-| Word/segment timestamps   | ✅                 | ✅                     | ❌                  | ❌                  |
-| Detected language         | ✅                 | ❌                     | ✅                  | ✅ *(fixed EN)*     |
-| Cancellation + progress   | ✅ *(per step)*    | ✅ *(per ~30 s window)*| ✅ *(per call)*     | ✅ *(per token)*    |
+| Capability                | whisper.cpp        | Parakeet TDT           | SenseVoice          | Moonshine           | Zipformer               |
+| ------------------------- | :----------------: | :--------------------: | :-----------------: | :-----------------: | :---------------------: |
+| Languages                 | any (auto-detect)  | 25 (fixed set)         | 5 (fixed set)       | English only        | per model               |
+| Initial prompt            | ✅                 | ❌                     | ❌                  | ❌                  | ❌                      |
+| Beam search               | ✅                 | ❌                     | ❌                  | ❌                  | ❌                      |
+| Translate → English       | ✅                 | ❌                     | ❌                  | ❌                  | ❌                      |
+| Internal VAD              | ✅                 | ❌                     | ❌                  | ❌                  | ❌                      |
+| Word/segment timestamps   | ✅                 | ✅                     | ❌                  | ❌                  | ❌                      |
+| Detected language         | ✅                 | ❌                     | ✅                  | ✅ *(fixed EN)*     | ❌                      |
+| Cancellation + progress   | ✅ *(per step)*    | ✅ *(per ~30 s window)*| ✅ *(per call)*     | ✅ *(per token)*    | ✅ *(per encoder frame)*|
 
 ---
 
@@ -269,8 +273,21 @@ models/sherpa-onnx-moonshine-base-en-int8/
 └── tokens.txt
 ```
 
+**Zipformer** — a **directory** (a sherpa-onnx offline zipformer transducer export, e.g.
+[`k2-fsa/sherpa-onnx-zipformer-gigaspeech-2023-12-12`](https://huggingface.co/csukuangfj/sherpa-onnx-zipformer-gigaspeech-2023-12-12))
+containing the three transducer graphs plus `tokens.txt`. File names vary between exports, so the
+loader matches by substring (`encoder` / `decoder` / `joiner`) and prefers the `int8` variant:
+
+```
+models/sherpa-onnx-zipformer-gigaspeech-2023-12-12/
+├── encoder-epoch-30-avg-1.int8.onnx (or the plain .onnx)
+├── decoder-epoch-30-avg-1.int8.onnx
+├── joiner-epoch-30-avg-1.int8.onnx
+└── tokens.txt
+```
+
 `EngineConfig::model_path` points at the **file** (whisper) or the **directory** (Parakeet,
-SenseVoice, Moonshine).
+SenseVoice, Moonshine, Zipformer).
 
 ---
 
@@ -318,9 +335,9 @@ let engine: Box<dyn AsrEngine> = load_engine(EngineKind::Whisper, &config)?;
 
 The crate does not orchestrate streaming — it gives you the primitive. The caller cuts audio
 into chunks (e.g. on speech pauses) and calls `transcribe` per chunk. On a long **one-shot**
-clip the Parakeet backend also windows internally (≤ 32 s per window, cutting on the
-lowest-energy point) and frees each window between passes, so ONNX Runtime's arena stays bounded
-to a single window's peak instead of growing with the whole clip.
+clip the Parakeet, SenseVoice and Moonshine backends also window internally (≤ 32 s per window,
+cutting on the lowest-energy point) and free each window between passes, so ONNX Runtime's arena
+stays bounded to a single window's peak instead of growing with the whole clip.
 
 ---
 
@@ -335,6 +352,9 @@ cargo run --example parakeet_smoke --features parakeet -- models/parakeet-tdt-v3
 
 # whisper smoke test — ggml .bin + WAV
 cargo run --example whisper_smoke --features whisper -- models/ggml-base.bin audio.wav
+
+# Zipformer smoke test — model directory + a mono 16 kHz WAV
+cargo run --example zipformer_smoke --features zipformer -- models/sherpa-onnx-zipformer-gigaspeech-2023-12-12 audio.wav
 
 # Swap both backends behind one Box<dyn AsrEngine>, on the same audio
 cargo run --example switch --features "whisper parakeet" -- audio.wav models/ggml-tiny.bin models/parakeet-tdt-v3

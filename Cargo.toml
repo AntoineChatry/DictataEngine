@@ -1,8 +1,8 @@
 [package]
 name = "dictata-engine"
 version = "0.1.0"
-edition = "2024"
-description = "Multi-backend offline ASR engine abstraction (whisper.cpp, NVIDIA Parakeet) for Rust"
+edition = "2026"
+description = "Multi-backend offline ASR engine abstraction (whisper.cpp, NVIDIA Parakeet, SenseVoice, Moonshine, Zipformer) for Rust"
 # Simplest permissive OSS license, OSI-approved (distinct from the Dictata app's
 # Commons Clause, which is not OSI). See LICENSE for the full text.
 license = "MIT"
@@ -37,6 +37,12 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = [
 # shares a single copy.
 realfft = { version = "3.5", optional = true }
 
+# Kaldi-compatible fbank front-end for the Zipformer transducer backend (feature
+# `zipformer`): a pure-Rust port of kaldi-native-fbank (rustfft-based, NO C/C++
+# build). Produces the exact povey-window features icefall zipformer models were
+# trained on, so we do not re-implement the finicky kaldi framing ourselves.
+kaldi-native-fbank = { version = "0.1", optional = true }
+
 [features]
 default = []
 # Backends enabled at compile time. Each isolates its heavy dependencies.
@@ -67,6 +73,11 @@ sensevoice = ["dep:ort", "dep:realfft"]
 # no extra FFT is needed. Needs a sherpa-onnx Moonshine "v1" export (a directory
 # with preprocess/encode/uncached_decode/cached_decode .onnx + tokens.txt).
 moonshine = ["dep:ort"]
+# Zipformer transducer backend (feature `zipformer`). Pulls ONNX Runtime via
+# `ort` directly (like `vad`) plus the pure-Rust kaldi-native-fbank front-end.
+# Needs a sherpa-onnx offline zipformer transducer export (a directory with
+# encoder/decoder/joiner .onnx + tokens.txt).
+zipformer = ["dep:ort", "dep:kaldi-native-fbank"]
 
 [dev-dependencies]
 # Used only by the `mic` example (live microphone capture). Does not enter the
@@ -82,3 +93,7 @@ required-features = ["whisper"]
 [[example]]
 name = "parakeet_smoke"
 required-features = ["parakeet"]
+
+[[example]]
+name = "zipformer_smoke"
+required-features = ["zipformer"]

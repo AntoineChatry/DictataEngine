@@ -202,30 +202,16 @@ impl MoonshineEngine {
             languages: LanguageSupport::Set(vec!["english".to_string()]),
         }
     }
-}
 
-impl AsrEngine for MoonshineEngine {
-    fn transcribe(
+    /// Run the full preprocess -> encode -> greedy-decode pipeline on a single
+    /// window (already `>= MIN_SAMPLES`) and return its detokenized text. Called
+    /// once per window by [`AsrEngine::transcribe`]; borrows `self` mutably and
+    /// releases it on return, so the ONNX arena settles between windows.
+    fn decode_window(
         &mut self,
         audio: &[f32],
-        _opts: &TranscribeOptions,
         control: &TranscribeControl,
-    ) -> Result<TranscriptionResult, AsrError> {
-        if audio.is_empty() {
-            return Ok(TranscriptionResult::default());
-        }
-        if control.is_cancelled() {
-            return Err(AsrError::Cancelled);
-        }
-        control.report_progress(0);
-
-        // Enforce the audio contract; a NaN/Inf sample poisons the conv front-end.
-        let audio = super::sanitize_audio(audio);
-        let audio = audio.as_ref();
-        if audio.len() < MIN_SAMPLES {
-            return Ok(TranscriptionResult::default());
-        }
-
+    ) -> Result<String, AsrError> {
         // 1) preprocess: raw waveform (1, N) -> features (1, T, dim).
         let audio_val = Value::from_array(([1_i64, audio.len() as i64], audio.to_vec()))
             .map_err(|e| AsrError::Transcribe(format!("moonshine audio tensor: {e}")))?;
@@ -264,8 +250,6 @@ impl AsrEngine for MoonshineEngine {
         };
         let enc_frames = shape_dim(&encoder_out, 1);
         let max_len = decode_step_cap(enc_frames);
-
-        control.report_progress(20);
 
         // 3) autoregressive greedy decode.
         let mut generated: Vec<i32> = Vec::new();
@@ -323,8 +307,69 @@ impl AsrEngine for MoonshineEngine {
             states = take_states(&mut out, &self.cac_out[1..])?;
         }
 
+        Ok(tokens_to_text(&generated, &self.tokens))
+    }
+}
+
+impl AsrEngine for MoonshineEngine {
+    fn transcribe(
+        &mut self,
+        audio: &[f32],
+        _opts: &TranscribeOptions,
+        control: &TranscribeControl,
+    ) -> Result<TranscriptionResult, AsrError> {
+        if audio.is_empty() {
+            return Ok(TranscriptionResult::default());
+        }
+        if control.is_cancelled() {
+            return Err(AsrError::Cancelled);
+        }
+        control.report_progress(0);
+
+        // Enforce the audio contract; a NaN/Inf sample poisons the conv front-end.
+        let audio = super::sanitize_audio(audio);
+        let audio = audio.as_ref();
+        if audio.len() < MIN_SAMPLES {
+            return Ok(TranscriptionResult::default());
+        }
+
+        // Moonshine is a short-form model: it encodes the WHOLE clip in one pass
+        // (ONNX Runtime's arena never returns its peak to the OS) and its decode
+        // step cap grows with duration, so a long clip balloons the RAM and makes
+        // the model hallucinate. Window the audio into bounded chunks (<= 32 s,
+        // cut on the least-bad energy dip) like the Parakeet backend, decode each
+        // and concatenate. Every sample is decoded exactly once (no overlap).
+        let mut text = String::new();
+        let total = audio.len();
+        let mut start = 0;
+        while start < audio.len() {
+            // Cancellation checked before each expensive window; progress is the
+            // fraction of samples already consumed.
+            if control.is_cancelled() {
+                return Err(AsrError::Cancelled);
+            }
+            control.report_progress((start as u64 * 100 / total as u64) as u8);
+
+            let rest = &audio[start..];
+            let cut = super::find_min_rms_cut(rest);
+            let window = &rest[..cut];
+            start += cut;
+
+            // A trailing window can fall below the conv front-end's minimum; it
+            // carries no decodable content, so skip it.
+            if window.len() < MIN_SAMPLES {
+                continue;
+            }
+            let piece = self.decode_window(window, control)?;
+            if !piece.is_empty() {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(&piece);
+            }
+        }
+
         control.report_progress(100);
-        let text = tokens_to_text(&generated, &self.tokens);
         Ok(TranscriptionResult {
             text,
             // Moonshine is English-only; report it rather than leaving it unknown.
