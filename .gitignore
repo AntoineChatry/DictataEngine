@@ -12,6 +12,8 @@
 # Outillage / caches locaux non partagés
 /.claude/
 /.ruff_cache/
+# Serena MCP (analyse LSP) : config/cache/mémoires locaux, non liés au crate.
+/.serena/
 
 # Fichiers backend / IDE locaux
 Cargo.lock.bak
