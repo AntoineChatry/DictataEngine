@@ -5,9 +5,14 @@
 //! only avoids reallocating the KV cache and compute buffers per chunk, without
 //! changing the result. Expected audio is mono 16 kHz `f32`.
 
+use std::sync::Once;
+
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
 };
+
+/// Guards the one-shot, process-global logging-hook install (see `load`).
+static LOGGING_HOOKS: Once = Once::new();
 
 use super::AsrEngine;
 use crate::error::AsrError;
@@ -33,6 +38,12 @@ impl WhisperEngine {
     /// when compiled (feature `vulkan`), `Cpu` disables it. `Gpu` does not fail
     /// on a CPU-only build — whisper.cpp simply falls back to CPU.
     pub fn load(config: &EngineConfig) -> Result<Self, AsrError> {
+        // Route whisper.cpp/ggml's noisy C log callback into the `log` crate
+        // instead of raw stderr. Idempotent (once per process); with no `log`
+        // subscriber installed the messages are dropped, so a default build stays
+        // quiet, while a consumer that wants them just installs a logger.
+        LOGGING_HOOKS.call_once(whisper_rs::install_logging_hooks);
+
         let model_path = config.model_path.as_path();
         if !model_path.exists() {
             return Err(AsrError::ModelNotFound(model_path.display().to_string()));

@@ -136,6 +136,10 @@ feature.**
 - **`libclang`** (bindgen) — usually part of the LLVM install
 - For `vulkan`: the **Vulkan SDK** present at build time
 
+whisper.cpp/ggml's own C log output is routed into the [`log`](https://crates.io/crates/log)
+crate rather than raw stderr, so it stays quiet unless you install a `log` subscriber (install
+one to see it — the level is then yours to filter).
+
 ### `parakeet` / `parakeet-directml`
 `parakeet-rs` uses ONNX Runtime through `ort`. By default `ort` downloads a prebuilt ONNX
 Runtime binary; to use a system install, follow the [`ort` docs](https://ort.pyke.io/).

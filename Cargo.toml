@@ -14,8 +14,10 @@ repository = "https://github.com/AntoineChatry/dictata-engine"
 thiserror = "2"
 
 # whisper.cpp backend (feature `whisper`). Optional: the base crate does not pull
-# it, so there is no C++ build while the feature is off.
-whisper-rs = { version = "0.16.0", optional = true }
+# it, so there is no C++ build while the feature is off. `log_backend` routes
+# whisper.cpp/ggml's C log callback into the `log` crate (see
+# `install_logging_hooks` in the whisper backend) instead of raw stderr.
+whisper-rs = { version = "0.16.0", features = ["log_backend"], optional = true }
 
 # NVIDIA Parakeet backend (feature `parakeet`). Pulls `ort`/onnxruntime.
 parakeet-rs = { version = "0.3", optional = true }
