@@ -1,6 +1,6 @@
 [package]
 name = "dictata-engine"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Multi-backend offline ASR engine abstraction (whisper.cpp, NVIDIA Parakeet, SenseVoice, Moonshine, Zipformer) for Rust"
 # Simplest permissive OSS license, OSI-approved (distinct from the Dictata app's

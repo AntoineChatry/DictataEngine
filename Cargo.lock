@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "dictata-engine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cpal",
  "kaldi-native-fbank",
