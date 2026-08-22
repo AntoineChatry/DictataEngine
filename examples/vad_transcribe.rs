@@ -1,24 +1,39 @@
-//! Manual smoke test of the Parakeet backend through the `AsrEngine` trait.
+//! Manual smoke test of the VAD-gated transcription pipeline.
+//!
+//! Runs the shared Silero VAD in front of any backend, so only speech regions
+//! are transcribed and the result is stitched back onto the original timeline.
 //!
 //! Usage:
-//!   cargo run --example parakeet_smoke --features parakeet -- <model_dir> <audio.wav>
+//!   cargo run --example vad_transcribe --features "vad,<backend>" -- \
+//!       <backend> <model_dir_or_file> <silero_vad.onnx> <audio.wav>
 //!
-//! `model_dir` must contain `encoder-model.onnx`, `decoder_joint-model.onnx`
-//! and `vocab.txt`. `audio.wav` must be 16-bit mono PCM at 16 kHz. The example
-//! does not depend on any audio crate: it reads the WAV file itself.
+//! `<backend>` is one of: whisper parakeet sensevoice moonshine zipformer. The
+//! matching backend feature must be enabled (e.g. `--features "vad,zipformer"`),
+//! otherwise the engine load reports `BackendUnavailable`. `audio.wav` must be
+//! 16-bit mono PCM at 16 kHz. Set `EXPECT_SUBSTR` to assert the output contains a
+//! substring (case-insensitive), turning this into a reproducible check.
 
-use dictata_engine::engines::ParakeetEngine;
-use dictata_engine::{AsrEngine, DevicePreference, EngineConfig, TranscribeControl, TranscribeOptions};
+use dictata_engine::pipeline::transcribe_with_vad;
+use dictata_engine::vad::{SileroVad, VadConfig};
+use dictata_engine::{
+    DevicePreference, EngineConfig, EngineKind, TranscribeControl, TranscribeOptions, load_engine,
+};
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let model_dir = args.next().expect("usage: <model_dir> <audio.wav>");
-    let wav = args.next().expect("usage: <model_dir> <audio.wav>");
-    let device = match args.next().as_deref() {
-        Some("gpu") => DevicePreference::Gpu,
-        _ => DevicePreference::Cpu,
+    let backend = args.next().expect("usage: <backend> <model> <silero.onnx> <audio.wav>");
+    let model = args.next().expect("usage: <backend> <model> <silero.onnx> <audio.wav>");
+    let silero = args.next().expect("usage: <backend> <model> <silero.onnx> <audio.wav>");
+    let wav = args.next().expect("usage: <backend> <model> <silero.onnx> <audio.wav>");
+
+    let kind = match backend.to_lowercase().as_str() {
+        "whisper" => EngineKind::Whisper,
+        "parakeet" => EngineKind::Parakeet,
+        "sensevoice" => EngineKind::SenseVoice,
+        "moonshine" => EngineKind::Moonshine,
+        "zipformer" => EngineKind::Zipformer,
+        other => panic!("unknown backend {other:?}"),
     };
-    println!("device requested : {device:?}");
 
     let audio = read_wav_mono_16k_f32(&wav);
     println!(
@@ -28,29 +43,34 @@ fn main() {
     );
 
     let config = EngineConfig {
-        model_path: model_dir.into(),
-        device,
+        model_path: model.into(),
+        device: DevicePreference::Cpu,
         default_language: None,
         crash_marker: None,
     };
+    let mut engine = load_engine(kind, &config).expect("loading backend");
+    println!("backend: {}", engine.capabilities().name);
+
+    let mut vad = SileroVad::load(&silero, VadConfig::default()).expect("loading Silero VAD");
 
     let t0 = std::time::Instant::now();
-    let mut engine = ParakeetEngine::load(&config).expect("loading Parakeet model");
-    println!("model loaded in {:.2} s", t0.elapsed().as_secs_f32());
-    println!("capabilities: {:?}", engine.capabilities());
-
-    let t1 = std::time::Instant::now();
-    let result = engine
-        .transcribe(&audio, &TranscribeOptions::default(), &TranscribeControl::none())
-        .expect("transcription");
-    println!("transcribed in {:.2} s", t1.elapsed().as_secs_f32());
+    let result = transcribe_with_vad(
+        engine.as_mut(),
+        &mut vad,
+        &audio,
+        &TranscribeOptions::default(),
+        &TranscribeControl::none(),
+    )
+    .expect("vad-gated transcription");
+    println!("done in {:.2} s", t0.elapsed().as_secs_f32());
 
     println!("language detected : {:?}", result.detected_language);
     println!("--- text ---\n{}\n-------------", result.text);
+    println!("segments ({}):", result.segments.len());
+    for s in &result.segments {
+        println!("  [{:6.2}s -> {:6.2}s] {}", s.start, s.end, s.text);
+    }
 
-    // Optional assertion: set EXPECT_SUBSTR to a substring the transcription must
-    // contain (case-insensitive). Absent -> exploratory run (print only); present
-    // and missing -> exit(1), so this doubles as a reproducible regression check.
     if let Ok(expect) = std::env::var("EXPECT_SUBSTR")
         && !expect.trim().is_empty()
     {

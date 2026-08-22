@@ -97,3 +97,13 @@ required-features = ["parakeet"]
 [[example]]
 name = "zipformer_smoke"
 required-features = ["zipformer"]
+
+# The VAD-gated pipeline example needs the `vad` feature; a backend feature is
+# added on top at run time to pick which engine to drive (e.g. "vad,zipformer").
+[[example]]
+name = "vad_transcribe"
+required-features = ["vad"]
+
+[[example]]
+name = "diarize_smoke"
+required-features = ["diarize"]

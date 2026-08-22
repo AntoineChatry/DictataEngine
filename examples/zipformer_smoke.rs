@@ -44,6 +44,20 @@ fn main() {
     println!("transcribed in {:.2} s", t1.elapsed().as_secs_f32());
 
     println!("--- text ---\n{}\n-------------", result.text);
+
+    // Optional assertion: set EXPECT_SUBSTR to a substring the transcription must
+    // contain (case-insensitive). Absent -> exploratory run (print only); present
+    // and missing -> exit(1), so this doubles as a reproducible regression check.
+    if let Ok(expect) = std::env::var("EXPECT_SUBSTR")
+        && !expect.trim().is_empty()
+    {
+        if result.text.to_lowercase().contains(&expect.to_lowercase()) {
+            println!("assertion OK: output contains {expect:?}");
+        } else {
+            eprintln!("assertion FAILED: output does not contain {expect:?}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Reads a 16-bit mono 16 kHz PCM WAV file into a `Vec<f32>` without external dependencies.

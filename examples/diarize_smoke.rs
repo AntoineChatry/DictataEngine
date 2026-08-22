@@ -1,24 +1,19 @@
-//! Manual smoke test of the Parakeet backend through the `AsrEngine` trait.
+//! Manual smoke test of speaker diarization (feature `diarize`).
 //!
 //! Usage:
-//!   cargo run --example parakeet_smoke --features parakeet -- <model_dir> <audio.wav>
+//!   cargo run --example diarize_smoke --features diarize -- <sortformer.onnx> <audio.wav>
 //!
-//! `model_dir` must contain `encoder-model.onnx`, `decoder_joint-model.onnx`
-//! and `vocab.txt`. `audio.wav` must be 16-bit mono PCM at 16 kHz. The example
-//! does not depend on any audio crate: it reads the WAV file itself.
+//! `<sortformer.onnx>` is a parakeet-rs-format Sortformer v2 export (e.g.
+//! `diar_streaming_sortformer_4spk-v2.onnx` from the altunenes/parakeet-rs HF
+//! repo). `audio.wav` must be 16-bit mono PCM at 16 kHz. Prints the detected
+//! speaker turns; set `EXPECT_SPEAKERS` to assert on the distinct-speaker count.
 
-use dictata_engine::engines::ParakeetEngine;
-use dictata_engine::{AsrEngine, DevicePreference, EngineConfig, TranscribeControl, TranscribeOptions};
+use dictata_engine::diarize::{DiarizeConfig, Diarizer};
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let model_dir = args.next().expect("usage: <model_dir> <audio.wav>");
-    let wav = args.next().expect("usage: <model_dir> <audio.wav>");
-    let device = match args.next().as_deref() {
-        Some("gpu") => DevicePreference::Gpu,
-        _ => DevicePreference::Cpu,
-    };
-    println!("device requested : {device:?}");
+    let model = args.next().expect("usage: <sortformer.onnx> <audio.wav>");
+    let wav = args.next().expect("usage: <sortformer.onnx> <audio.wav>");
 
     let audio = read_wav_mono_16k_f32(&wav);
     println!(
@@ -27,37 +22,37 @@ fn main() {
         audio.len() as f32 / 16_000.0
     );
 
-    let config = EngineConfig {
-        model_path: model_dir.into(),
-        device,
-        default_language: None,
-        crash_marker: None,
-    };
-
     let t0 = std::time::Instant::now();
-    let mut engine = ParakeetEngine::load(&config).expect("loading Parakeet model");
+    let mut diarizer = Diarizer::load(&model, DiarizeConfig::default()).expect("loading Sortformer");
     println!("model loaded in {:.2} s", t0.elapsed().as_secs_f32());
-    println!("capabilities: {:?}", engine.capabilities());
 
     let t1 = std::time::Instant::now();
-    let result = engine
-        .transcribe(&audio, &TranscribeOptions::default(), &TranscribeControl::none())
-        .expect("transcription");
-    println!("transcribed in {:.2} s", t1.elapsed().as_secs_f32());
+    let segments = diarizer.diarize(&audio).expect("diarization");
+    println!("diarized in {:.2} s", t1.elapsed().as_secs_f32());
 
-    println!("language detected : {:?}", result.detected_language);
-    println!("--- text ---\n{}\n-------------", result.text);
+    let sr = 16_000.0;
+    println!("segments ({}):", segments.len());
+    for s in &segments {
+        println!(
+            "  [{:6.2}s -> {:6.2}s] speaker {}",
+            s.start as f32 / sr,
+            s.end as f32 / sr,
+            s.speaker
+        );
+    }
 
-    // Optional assertion: set EXPECT_SUBSTR to a substring the transcription must
-    // contain (case-insensitive). Absent -> exploratory run (print only); present
-    // and missing -> exit(1), so this doubles as a reproducible regression check.
-    if let Ok(expect) = std::env::var("EXPECT_SUBSTR")
-        && !expect.trim().is_empty()
+    let mut speakers: Vec<usize> = segments.iter().map(|s| s.speaker).collect();
+    speakers.sort_unstable();
+    speakers.dedup();
+    println!("distinct speakers: {} -> {:?}", speakers.len(), speakers);
+
+    if let Ok(expect) = std::env::var("EXPECT_SPEAKERS")
+        && let Ok(n) = expect.trim().parse::<usize>()
     {
-        if result.text.to_lowercase().contains(&expect.to_lowercase()) {
-            println!("assertion OK: output contains {expect:?}");
+        if speakers.len() == n {
+            println!("assertion OK: {n} distinct speaker(s)");
         } else {
-            eprintln!("assertion FAILED: output does not contain {expect:?}");
+            eprintln!("assertion FAILED: expected {n} speakers, got {}", speakers.len());
             std::process::exit(1);
         }
     }
