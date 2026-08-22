@@ -193,6 +193,31 @@ let speech_only = vad.collect_speech(audio)?; // silence dropped, ready for tran
 # Ok(()) }
 ```
 
+For the common case — *run the VAD in front of a backend, transcribe only the speech, keep the
+original timeline* — the crate wires the two together for you with `pipeline::transcribe_with_vad`,
+so you don't re-implement the offset bookkeeping. It transcribes each speech span, drops the
+silence, and stitches every segment back onto the **original** timeline; backends that emit no
+timestamps (Zipformer, SenseVoice, Moonshine) get one segment synthesized per span, so the result
+always carries a coherent timeline. Cancellation and progress work as usual (progress tracks the
+fraction of *speech* already transcribed).
+
+```rust
+# #[cfg(feature = "vad")]
+# fn demo(engine: &mut dyn dictata_engine::AsrEngine, audio: &[f32]) -> Result<(), dictata_engine::AsrError> {
+use dictata_engine::pipeline::transcribe_with_vad;
+use dictata_engine::vad::{SileroVad, VadConfig};
+use dictata_engine::{TranscribeOptions, TranscribeControl};
+
+let mut vad = SileroVad::load("models/silero_vad.onnx", VadConfig::default())?;
+let result = transcribe_with_vad(
+    engine, &mut vad, audio,
+    &TranscribeOptions::default(),
+    &TranscribeControl::none(),
+)?;
+println!("{}", result.text);
+# Ok(()) }
+```
+
 Bring a **Silero v5** ONNX model (`silero_vad.onnx`, ~2 MB, from
 [snakers4/silero-vad](https://github.com/snakers4/silero-vad)) — not bundled, like the ASR
 models. `VadConfig` exposes the usual knobs (`threshold`, `min_speech_ms`, `min_silence_ms`,
@@ -356,6 +381,12 @@ cargo run --example whisper_smoke --features whisper -- models/ggml-base.bin aud
 # Zipformer smoke test — model directory + a mono 16 kHz WAV
 cargo run --example zipformer_smoke --features zipformer -- models/sherpa-onnx-zipformer-gigaspeech-2023-12-12 audio.wav
 
+# VAD-gated transcription — Silero in front of any backend (here Zipformer), speech only
+cargo run --example vad_transcribe --features "vad,zipformer" -- zipformer models/sherpa-onnx-zipformer-gigaspeech-2023-12-12 models/silero_vad.onnx audio.wav
+
+# Speaker diarization — who spoke when (Sortformer .onnx + WAV)
+cargo run --example diarize_smoke --features diarize -- models/diar_streaming_sortformer_4spk-v2.onnx audio.wav
+
 # Swap both backends behind one Box<dyn AsrEngine>, on the same audio
 cargo run --example switch --features "whisper parakeet" -- audio.wav models/ggml-tiny.bin models/parakeet-tdt-v3
 
@@ -372,9 +403,10 @@ cargo run --example mic --features "whisper parakeet" -- models/ggml-tiny.bin mo
 cargo test --features "whisper parakeet"
 ```
 
-Unit tests cover the trait, the `load_engine` factory, audio sanitizing, and the Parakeet
-windowing math. They do **not** require a model — the model-dependent checks are the smoke
-examples above.
+Unit tests cover the trait, the `load_engine` factory, audio sanitizing, the Parakeet
+windowing math, and the VAD pipeline's segment placement (timeline shift vs. synthesized
+segment). They do **not** require a model — the model-dependent checks are the smoke examples
+above.
 
 ---
 
