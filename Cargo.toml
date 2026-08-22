@@ -6,7 +6,7 @@ description = "Multi-backend offline ASR engine abstraction (whisper.cpp, NVIDIA
 # Simplest permissive OSS license, OSI-approved (distinct from the Dictata app's
 # Commons Clause, which is not OSI). See LICENSE for the full text.
 license = "MIT"
-repository = "https://github.com/AntoineChatry/dictata-engine"
+repository = "https://github.com/AntoineChatry/DictataEngine"
 
 [dependencies]
 # thiserror: pure Rust, light, standard. It is NOT a heavy native dependency
